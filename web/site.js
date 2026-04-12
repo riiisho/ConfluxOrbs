@@ -21,17 +21,24 @@ let lastScreenY = window.screenY;
 let time = 0;
 let anger = 0; // 0..1 proximity anger level
 
-const ORB_RADIUS = 68;
-const PARTICLE_COUNT = 220;
+const ORB_RADIUS = 96;
+const PARTICLE_COUNT = 1024;
+const TENDRIL_COUNT = 4;
 
-const particles = Array.from({ length: PARTICLE_COUNT }, () => ({
-  phi: Math.acos(1 - 2 * Math.random()),         // uniform over sphere
-  theta: Math.random() * Math.PI * 2,
-  r: ORB_RADIUS * (0.65 + Math.random() * 0.4),
-  speed: (0.009 + Math.random() * 0.022) * (Math.random() < 0.5 ? 1 : -1),
-  phiSpeed: (Math.random() - 0.5) * 0.003,
-  size: 1.2 + Math.random() * 2.2,
-}));
+const particles = Array.from({ length: PARTICLE_COUNT }, (_, i) => {
+  const tid = i % TENDRIL_COUNT;
+  return {
+    phi: Math.acos(1 - 2 * Math.random()),
+    theta: Math.random() * Math.PI * 2,
+    r: ORB_RADIUS * (0.65 + Math.random() * 0.4),
+    speed: (0.009 + Math.random() * 0.022) * (Math.random() < 0.5 ? 1 : -1),
+    phiSpeed: (Math.random() - 0.5) * 0.003,
+    size: 1.2 + Math.random() * 2.2,
+    // Tendril group: fixed lateral track and wave phase
+    tendrilOffset: (tid - (TENDRIL_COUNT - 1) / 2) * 22, // -44..44 px lateral spread
+    tendrilPhase: (tid / TENDRIL_COUNT) * Math.PI * 2,
+  };
+});
 
 channel.onmessage = (event) => {
   const data = event.data;
@@ -74,15 +81,21 @@ function update() {
     const sdx = (o.winX + o.orbX) - (window.screenX + orbX);
     const sdy = (o.winY + o.orbY) - (window.screenY + orbY);
     const dist = Math.hypot(sdx, sdy);
-    if (dist < 600 && dist > 0) {
-      const pull = ((600 - dist) / 600) * 0.015;
-      velX += (sdx / dist) * pull * canvas.width;
-      velY += (sdy / dist) * pull * canvas.height;
+    if (dist < 700 && dist > 0) {
+      // Spring: attract beyond restDist, repel below it
+      const restDist = 160;
+      const force = ((dist - restDist) / 700) * 0.28;
+      velX += (sdx / dist) * force;
+      velY += (sdy / dist) * force;
     }
   }
 
-  velX *= 0.86;
-  velY *= 0.86;
+  velX *= 0.84;
+  velY *= 0.84;
+  // Cap velocity so a sudden window snap can't fling the orb
+  const maxV = 14;
+  velX = Math.max(-maxV, Math.min(maxV, velX));
+  velY = Math.max(-maxV, Math.min(maxV, velY));
   orbX += velX;
   orbY += velY;
 
@@ -131,12 +144,14 @@ function lerpRGB(r1, g1, b1, r2, g2, b2, t) {
   ];
 }
 
-function drawVortexOrb(cx, cy, alphaScale) {
+// targetX/Y: canvas position of the other orb to reach toward. tp: 0..1 proximity strength.
+function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
   const pulse = Math.sin(time * 0.045) * 5;
   const scale = (ORB_RADIUS + pulse) / ORB_RADIUS;
 
   ctx.save();
   ctx.globalAlpha = alphaScale;
+  ctx.shadowBlur = 0;
 
   // Ambient halo — shifts from purple to red/orange with anger
   const hr = Math.round(120 + anger * 135);
@@ -151,67 +166,78 @@ function drawVortexOrb(cx, cy, alphaScale) {
   ctx.fillStyle = halo;
   ctx.fill();
 
-  // Project all particles and sort back→front
+  // Direction toward other orb for particle pull
+  let tdx = 0, tdy = 0, tdist = 0;
+  if (tp > 0 && targetX !== undefined) {
+    tdx = targetX - cx;
+    tdy = targetY - cy;
+    tdist = Math.hypot(tdx, tdy);
+    if (tdist > 0) { tdx /= tdist; tdy /= tdist; }
+  }
+
+  // Project all particles — facing ones stream out in tendril groups
   const projected = particles
-    .map(p => ({ ...project(cx, cy, p, scale), size: p.size }))
+    .map(p => {
+      const proj = project(cx, cy, p, scale);
+      let ptx = proj.x, pty = proj.y;
+      if (tp > 0 && tdist > 0) {
+        const offx = ptx - cx;
+        const offy = pty - cy;
+        const offLen = Math.hypot(offx, offy) || 1;
+        const facing = (offx * tdx + offy * tdy) / offLen; // -1..1
+        if (facing > 0.05) {
+          // How far along the arm this particle travels
+          const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, 430);
+          // Arm progress 0..1 used to drive the snake wave
+          const armT = pull / Math.max(tdist * 0.70, 1);
+          // Each tendril group snakes with its own phase; wave grows then fades at tip
+          const wave = Math.sin(time * 0.08 + p.tendrilPhase + armT * Math.PI * 2.8)
+                       * 28 * tp * Math.sin(armT * Math.PI);
+          // Fixed lateral track + wave — perpendicular in 2D is (-tdy, tdx)
+          const lateral = p.tendrilOffset * tp + wave;
+          ptx += tdx * pull + (-tdy) * lateral;
+          pty += tdy * pull +  tdx  * lateral;
+        }
+      }
+      return { x: ptx, y: pty, depth: proj.depth, size: p.size };
+    })
     .sort((a, b) => a.depth - b.depth);
 
+  // Precompute colours once per frame (same for all particles)
+  const [cr, cg, cb] = lerpRGB(95, 50, 255, 255, 40, 0, anger);
+
+  // Pass 1 — soft glow halos (large, very transparent, no shadowBlur needed)
+  for (const p of projected) {
+    const d = p.depth;
+    const glowSize = p.size * (1.5 + d * 2.5) * (1 + anger * 1.2);
+    const alpha = (0.018 + d * 0.032 + anger * 0.025);
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, glowSize, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${alpha})`;
+    ctx.fill();
+  }
+
+  // Pass 2 — tight bright cores
   for (const p of projected) {
     const d = p.depth;
     const size = p.size * (0.25 + d * 0.95) * (1 + anger * 0.75);
-    const [r, g, b] = lerpRGB(95, 50, 255, 255, 40, 0, anger);
-    const alpha = 0.22 + d * 0.68 + anger * 0.12;
-
-    ctx.save();
-    // Back particles are dimmer; front particles get strong glow when angry
-    const glowAmt = (7 + anger * 26) * (0.2 + d * 0.8);
-    const sr = Math.round(120 + anger * 135);
-    const sg = Math.round(70 * (1 - anger));
-    const sb = Math.round(255 * (1 - anger));
-    ctx.shadowColor = `rgba(${sr}, ${sg}, ${sb}, ${0.4 + anger * 0.55})`;
-    ctx.shadowBlur = glowAmt;
+    const alpha = 0.20 + d * 0.70 + anger * 0.10;
     ctx.beginPath();
     ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${r}, ${g}, ${b}, ${alpha})`;
+    ctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${alpha})`;
     ctx.fill();
-    ctx.restore();
   }
 
   ctx.restore();
 }
 
-function drawBeam(x1, y1, x2, y2, progress) {
-  ctx.save();
-  const mx = (x1 + x2) / 2 + Math.sin(time * 0.06) * 25 * progress;
-  const my = (y1 + y2) / 2 + Math.cos(time * 0.06) * 25 * progress;
 
-  const r = Math.round(155 + anger * 100);
-  const g = Math.round(95 * (1 - anger * 0.85));
-  const b = Math.round(255 * (1 - anger));
-
-  ctx.lineWidth = 2 + progress * 10;
-  ctx.lineCap = "round";
-  ctx.strokeStyle = `rgba(${r}, ${g}, ${b}, ${progress * 0.3})`;
-  ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.9)`;
-  ctx.shadowBlur = (30 + anger * 20) * progress;
-  ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.quadraticCurveTo(mx, my, x2, y2);
-  ctx.stroke();
-
-  ctx.lineWidth = 1.5 * progress;
-  ctx.strokeStyle = `rgba(${Math.min(r + 65, 255)}, ${Math.min(g + 65, 255)}, ${Math.min(b + 65, 255)}, ${progress * 0.85})`;
-  ctx.shadowBlur = 8;
-  ctx.beginPath();
-  ctx.moveTo(x1, y1);
-  ctx.quadraticCurveTo(mx, my, x2, y2);
-  ctx.stroke();
-
-  ctx.restore();
-}
 
 function draw() {
   ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // Collect all nearby targets, weighted by proximity
+  let weightedTX = 0, weightedTY = 0, totalWeight = 0;
 
   for (const key in others) {
     const o = others[key];
@@ -222,12 +248,21 @@ function draw() {
 
     if (dist < maxDist) {
       const progress = 1 - dist / maxDist;
-      drawBeam(orbX, orbY, localX, localY, progress);
-      drawVortexOrb(localX, localY, progress);
+      // Their orb reaches toward mine
+      drawVortexOrb(localX, localY, progress, orbX, orbY, progress);
+      // Accumulate weighted centroid for my reach direction
+      weightedTX += localX * progress;
+      weightedTY += localY * progress;
+      totalWeight += progress;
     }
   }
 
-  drawVortexOrb(orbX, orbY, 1);
+  // My orb reaches toward the weighted centre of all nearby orbs — no snapping
+  if (totalWeight > 0) {
+    drawVortexOrb(orbX, orbY, 1, weightedTX / totalWeight, weightedTY / totalWeight, Math.min(totalWeight, 1));
+  } else {
+    drawVortexOrb(orbX, orbY, 1, undefined, undefined, 0);
+  }
 }
 
 function loop() {
