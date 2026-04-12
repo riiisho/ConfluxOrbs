@@ -153,17 +153,24 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
   ctx.globalAlpha = alphaScale;
   ctx.shadowBlur = 0;
 
-  // Ambient halo — shifts from purple to red/orange with anger
-  const hr = Math.round(120 + anger * 135);
-  const hg = Math.round(65 * (1 - anger * 0.85));
-  const hb = Math.round(255 * (1 - anger * 0.92));
-  const halo = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 0.1, cx, cy, ORB_RADIUS * 3.8);
-  halo.addColorStop(0,    `rgba(${hr}, ${hg}, ${hb}, ${0.45 + anger * 0.35})`);
-  halo.addColorStop(0.45, `rgba(${hr}, ${hg}, ${hb}, ${0.1 + anger * 0.12})`);
-  halo.addColorStop(1,    "rgba(0,0,0,0)");
+  // Subtle glow — gradient to solid bg colour avoids premultiplied banding
+  const hr = Math.round(100 + anger * 140);
+  const hg = Math.round(55 * (1 - anger * 0.85));
+  const hb = Math.round(240 * (1 - anger * 0.9));
+  const innerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 0.6, cx, cy, ORB_RADIUS * 1.8);
+  innerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.12 + anger * 0.08})`);
+  innerG.addColorStop(1,   `rgba(15, 15, 15, 0)`);
   ctx.beginPath();
-  ctx.arc(cx, cy, ORB_RADIUS * 3.8, 0, Math.PI * 2);
-  ctx.fillStyle = halo;
+  ctx.arc(cx, cy, ORB_RADIUS * 1.8, 0, Math.PI * 2);
+  ctx.fillStyle = innerG;
+  ctx.fill();
+
+  const outerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 1.0, cx, cy, ORB_RADIUS * 3.5);
+  outerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.04 + anger * 0.04})`);
+  outerG.addColorStop(1,   `rgba(15, 15, 15, 0)`);
+  ctx.beginPath();
+  ctx.arc(cx, cy, ORB_RADIUS * 3.5, 0, Math.PI * 2);
+  ctx.fillStyle = outerG;
   ctx.fill();
 
   // Direction toward other orb for particle pull
@@ -233,8 +240,109 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
 
 
 
+const GRID_SPACING = 52;
+
+function getOrbPositions() {
+  const orbs = [{ x: orbX, y: orbY, anger }];
+  for (const key in others) {
+    const o = others[key];
+    const lx = (o.winX + o.orbX) - window.screenX;
+    const ly = (o.winY + o.orbY) - window.screenY;
+    orbs.push({ x: lx, y: ly, anger });
+  }
+  return orbs;
+}
+
+function displacePoint(gx, gy, orbs) {
+  let dx = 0, dy = 0;
+  for (const o of orbs) {
+    const ex = o.x - gx;
+    const ey = o.y - gy;
+    const dist = Math.hypot(ex, ey);
+    const radius = 340;
+    if (dist < radius && dist > 0) {
+      const t = 1 - dist / radius;
+      const strength = t * t * 95;
+      dx += (ex / dist) * strength;
+      dy += (ey / dist) * strength;
+    }
+  }
+  return { x: gx + dx, y: gy + dy };
+}
+
+function drawGrid() {
+  const orbs = getOrbPositions();
+  const pad = GRID_SPACING * 2;
+  const startX = -pad;
+  const startY = -pad;
+  const endX = canvas.width + pad;
+  const endY = canvas.height + pad;
+  const cols = Math.ceil((endX - startX) / GRID_SPACING) + 1;
+  const rows = Math.ceil((endY - startY) / GRID_SPACING) + 1;
+
+  // Build displaced vertex grid
+  const verts = [];
+  for (let r = 0; r < rows; r++) {
+    verts[r] = [];
+    for (let c = 0; c < cols; c++) {
+      const gx = startX + c * GRID_SPACING;
+      const gy = startY + r * GRID_SPACING;
+      verts[r][c] = displacePoint(gx, gy, orbs);
+    }
+  }
+
+  // All lines in one path — no per-segment colour allocation
+  ctx.beginPath();
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const v = verts[r][c];
+      if (c === 0) ctx.moveTo(v.x, v.y);
+      else ctx.lineTo(v.x, v.y);
+    }
+  }
+  for (let c = 0; c < cols; c++) {
+    for (let r = 0; r < rows; r++) {
+      const v = verts[r][c];
+      if (r === 0) ctx.moveTo(v.x, v.y);
+      else ctx.lineTo(v.x, v.y);
+    }
+  }
+  const gridR = Math.round(38 + anger * 40);
+  const gridG = Math.round(22 + anger * 5);
+  const gridB = Math.round(72 + anger * 30);
+  ctx.strokeStyle = `rgba(${gridR}, ${gridG}, ${gridB}, 0.55)`;
+  ctx.lineWidth = 0.6;
+  ctx.stroke();
+
+  // Bright nodes at intersections near orbs
+  const nodeR = Math.round(100 + anger * 155);
+  const nodeG = Math.round(60 * (1 - anger * 0.7));
+  const nodeB = Math.round(220 * (1 - anger * 0.85));
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const gx = startX + c * GRID_SPACING;
+      const gy = startY + r * GRID_SPACING;
+      let closest = Infinity;
+      for (const o of orbs) {
+        const d = Math.hypot(gx - o.x, gy - o.y);
+        if (d < closest) closest = d;
+      }
+      if (closest < 300) {
+        const g = Math.pow(1 - closest / 300, 2.2) * 0.85;
+        const v = verts[r][c];
+        ctx.beginPath();
+        ctx.arc(v.x, v.y, 1.3, 0, Math.PI * 2);
+        ctx.fillStyle = `rgba(${nodeR}, ${nodeG}, ${nodeB}, ${g.toFixed(3)})`;
+        ctx.fill();
+      }
+    }
+  }
+}
+
 function draw() {
-  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = '#0f0f0f';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  drawGrid();
 
   // Collect all nearby targets, weighted by proximity
   let weightedTX = 0, weightedTY = 0, totalWeight = 0;
