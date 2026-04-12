@@ -19,7 +19,8 @@ let velY = 0;
 let lastScreenX = window.screenX;
 let lastScreenY = window.screenY;
 let time = 0;
-let anger = 0; // 0..1 proximity anger level
+let anger = 0;  // 0..1 proximity anger level
+let merge = 0;  // 0..1 deep collision level
 
 const ORB_RADIUS = 96;
 const PARTICLE_COUNT = 1024;
@@ -104,11 +105,18 @@ function update() {
   const targetAnger = closest < 450 ? Math.pow(1 - closest / 450, 1.1) : 0;
   anger += (targetAnger - anger) * 0.045;
 
+  // Merge: kicks in at very close range — galaxy collision mode
+  const targetMerge = closest < 220 ? Math.pow(1 - closest / 220, 1.4) : 0;
+  merge += (targetMerge - merge) * 0.03;
+
   // Spin particles — faster and more chaotic when angry
-  const spinMult = 1 + anger * 3.2;
+  // Also flatten phi toward equator as merge increases (galactic disc)
+  const spinMult = 1 + anger * 3.2 + merge * 4.5;
+  const discPull = merge * 0.06; // pull phi toward π/2
   for (const p of particles) {
     p.theta += p.speed * spinMult;
     p.phi += p.phiSpeed * (1 + anger * 1.5);
+    p.phi += (Math.PI / 2 - p.phi) * discPull;
     if (p.phi < 0.05) { p.phi = 0.05; p.phiSpeed *= -1; }
     if (p.phi > Math.PI - 0.05) { p.phi = Math.PI - 0.05; p.phiSpeed *= -1; }
   }
@@ -147,7 +155,9 @@ function lerpRGB(r1, g1, b1, r2, g2, b2, t) {
 // targetX/Y: canvas position of the other orb to reach toward. tp: 0..1 proximity strength.
 function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
   const pulse = Math.sin(time * 0.045) * 5;
-  const scale = (ORB_RADIUS + pulse) / ORB_RADIUS;
+  // Orb swells up to 1.55x during a full merge
+  const mergeScale = 1 + merge * 0.55;
+  const scale = ((ORB_RADIUS + pulse) / ORB_RADIUS) * mergeScale;
 
   ctx.save();
   ctx.globalAlpha = alphaScale;
@@ -157,19 +167,19 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
   const hr = Math.round(100 + anger * 140);
   const hg = Math.round(55 * (1 - anger * 0.85));
   const hb = Math.round(240 * (1 - anger * 0.9));
-  const innerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 0.6, cx, cy, ORB_RADIUS * 1.8);
-  innerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.12 + anger * 0.08})`);
+  const innerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 0.6, cx, cy, ORB_RADIUS * 1.8 * mergeScale);
+  innerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.12 + anger * 0.08 + merge * 0.28})`);
   innerG.addColorStop(1,   `rgba(15, 15, 15, 0)`);
   ctx.beginPath();
-  ctx.arc(cx, cy, ORB_RADIUS * 1.8, 0, Math.PI * 2);
+  ctx.arc(cx, cy, ORB_RADIUS * 1.8 * mergeScale, 0, Math.PI * 2);
   ctx.fillStyle = innerG;
   ctx.fill();
 
-  const outerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 1.0, cx, cy, ORB_RADIUS * 3.5);
-  outerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.04 + anger * 0.04})`);
+  const outerG = ctx.createRadialGradient(cx, cy, ORB_RADIUS * 1.0, cx, cy, ORB_RADIUS * 4.5 * mergeScale);
+  outerG.addColorStop(0,   `rgba(${hr}, ${hg}, ${hb}, ${0.04 + anger * 0.04 + merge * 0.12})`);
   outerG.addColorStop(1,   `rgba(15, 15, 15, 0)`);
   ctx.beginPath();
-  ctx.arc(cx, cy, ORB_RADIUS * 3.5, 0, Math.PI * 2);
+  ctx.arc(cx, cy, ORB_RADIUS * 4.5 * mergeScale, 0, Math.PI * 2);
   ctx.fillStyle = outerG;
   ctx.fill();
 
@@ -182,28 +192,33 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
     if (tdist > 0) { tdx /= tdist; tdy /= tdist; }
   }
 
-  // Project all particles — facing ones stream out in tendril groups
+  // Project all particles — facing ones stream out in tendril groups,
+  // back-facing ones get flung as tidal streamers during merge
   const projected = particles
     .map(p => {
       const proj = project(cx, cy, p, scale);
       let ptx = proj.x, pty = proj.y;
+      const offx = ptx - cx;
+      const offy = pty - cy;
+      const offLen = Math.hypot(offx, offy) || 1;
+
       if (tp > 0 && tdist > 0) {
-        const offx = ptx - cx;
-        const offy = pty - cy;
-        const offLen = Math.hypot(offx, offy) || 1;
-        const facing = (offx * tdx + offy * tdy) / offLen; // -1..1
+        const facing = (offx * tdx + offy * tdy) / offLen;
         if (facing > 0.05) {
-          // How far along the arm this particle travels
+          // Forward hemisphere: tendril arms toward target
           const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, 430);
-          // Arm progress 0..1 used to drive the snake wave
           const armT = pull / Math.max(tdist * 0.70, 1);
-          // Each tendril group snakes with its own phase; wave grows then fades at tip
           const wave = Math.sin(time * 0.08 + p.tendrilPhase + armT * Math.PI * 2.8)
                        * 28 * tp * Math.sin(armT * Math.PI);
-          // Fixed lateral track + wave — perpendicular in 2D is (-tdy, tdx)
           const lateral = p.tendrilOffset * tp + wave;
           ptx += tdx * pull + (-tdy) * lateral;
           pty += tdy * pull +  tdx  * lateral;
+        } else if (merge > 0.05 && facing < -0.2) {
+          // Back hemisphere during merge: tidal streamer flung opposite, curving away
+          const tidalStr = Math.pow(-facing, 1.2) * merge * ORB_RADIUS * 2.8;
+          const curl = Math.sin(time * 0.05 + p.tendrilPhase) * tidalStr * 0.45;
+          ptx -= tdx * tidalStr + (-tdy) * curl;
+          pty -= tdy * tidalStr +  tdx  * curl;
         }
       }
       return { x: ptx, y: pty, depth: proj.depth, size: p.size };
