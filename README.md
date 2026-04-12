@@ -2,7 +2,7 @@
 
 A multi-window canvas experiment where glowing particle orbs react to each other across browser windows. Open the page in two or more windows, position them side by side, and watch the orbs reach toward one another with plasma tendrils, swell with anger as they approach, and erupt into a galaxy collision when they meet.
 
-**[Live demo](https://henryriveraCS.github.io/ConfluxOrbs)** <!-- update username if needed -->
+**[Live demo](https://riiisho.github.io/ConfluxOrbs/)**
 
 ## How it works
 
@@ -29,7 +29,7 @@ A warped grid is drawn beneath the orbs, displaced by each orb's gravity well.
 No build step — just open the file directly.
 
 ```bash
-git clone https://github.com/henryriveraCS/ConfluxOrbs.git   # update username if needed
+git clone https://github.com/<your-username>/ConfluxOrbs.git   # update username if needed
 cd ConfluxOrbs/docs
 # open index.html in your browser (or serve with any static server)
 npx serve .
