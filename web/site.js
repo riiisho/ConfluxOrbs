@@ -21,9 +21,14 @@ let lastScreenY = window.screenY;
 let time = 0;
 let anger = 0;  // 0..1 proximity anger level
 let merge = 0;  // 0..1 deep collision level
+let mySmoothedTp = 0;   // smoothed version of totalWeight, prevents tendril snap
+let smoothedTgtX = 0, smoothedTgtY = 0; // last-known weighted target for my orb
 
 const ORB_RADIUS = 96;
 const TENDRIL_COUNT = 4;
+// Pre-computed tilt constants — saves 2 trig calls per particle per frame
+const TILT_COS = Math.cos(0.44);
+const TILT_SIN = Math.sin(0.44);
 
 // ── Particle layers ──────────────────────────────────────────────────────────
 // CORE   : tiny, very bright, fast spin — the hot combusting nucleus
@@ -83,11 +88,15 @@ const particles = [];
 for (const [layer, count] of Object.entries(COUNTS)) {
   for (let i = 0; i < count; i++) particles.push(makeParticle(Number(layer), i));
 }
+// Pre-allocated projection buffer — reused every frame to avoid GC pressure
+const _projBuf = particles.map(() => ({ x: 0, y: 0, depth: 0, size: 0, layer: 0, noiseOffset: 0 }));
 
 channel.onmessage = (event) => {
   const data = event.data;
   if (data.id !== id) {
-    others[data.id] = { ...data, lastSeen: Date.now() };
+    // Preserve smoothTp across message updates so it keeps interpolating
+    const prev = others[data.id];
+    others[data.id] = { ...data, lastSeen: Date.now(), smoothTp: prev ? prev.smoothTp : 0 };
   }
 };
 
@@ -168,7 +177,8 @@ function update() {
     if (p.phi > Math.PI - 0.04) { p.phi = Math.PI - 0.04; p.phiSpeed *= -1; }
   }
 
-  broadcast();
+  // Broadcast every other frame — halves channel traffic, position is still smooth
+  if (time % 2 === 0) broadcast();
 
   const now = Date.now();
   for (const key in others) {
@@ -183,10 +193,9 @@ function project(cx, cy, p, scale) {
   const x3 = r * sinPhi * Math.cos(p.theta);
   const y3 = r * Math.cos(p.phi);
   const z3 = r * sinPhi * Math.sin(p.theta);
-  // Tilt 25° toward viewer so the vortex reads as 3D
-  const tilt = 0.44;
-  const y2 = y3 * Math.cos(tilt) - z3 * Math.sin(tilt);
-  const z2 = y3 * Math.sin(tilt) + z3 * Math.cos(tilt);
+  // Tilt 25° toward viewer so the vortex reads as 3D (constants pre-computed)
+  const y2 = y3 * TILT_COS - z3 * TILT_SIN;
+  const z2 = y3 * TILT_SIN + z3 * TILT_COS;
   const depth = (z2 / r + 1) / 2; // 0=back 1=front
   return { x: cx + x3, y: cy + y2, depth };
 }
@@ -239,39 +248,43 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
     if (tdist > 0) { tdx /= tdist; tdy /= tdist; }
   }
 
-  // Project all particles — layer-aware displacement
-  const projected = particles
-    .map(p => {
-      const proj = project(cx, cy, p, scale);
-      let ptx = proj.x, pty = proj.y;
-      const offx = ptx - cx;
-      const offy = pty - cy;
-      const offLen = Math.hypot(offx, offy) || 1;
+  // Project all particles — fill pre-allocated buffer to avoid per-frame GC
+  for (let i = 0; i < particles.length; i++) {
+    const p = particles[i];
+    const proj = project(cx, cy, p, scale);
+    let ptx = proj.x, pty = proj.y;
+    const offx = ptx - cx;
+    const offy = pty - cy;
+    const offLen = Math.hypot(offx, offy) || 1;
 
-      if (tp > 0 && tdist > 0) {
-        const facing = (offx * tdx + offy * tdy) / offLen;
-        const canTendril = p.layer === LAYER.RING || p.layer === LAYER.HALO;
-        if (canTendril && facing > 0.05) {
-          const maxReach = p.layer === LAYER.HALO ? 380 : 430;
-          const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, maxReach);
-          const armT = pull / Math.max(tdist * 0.70, 1);
-          const waveMag = p.layer === LAYER.HALO ? 44 : 28;
-          const wave = Math.sin(time * 0.08 + p.tendrilPhase + armT * Math.PI * 2.8)
-                       * waveMag * tp * Math.sin(armT * Math.PI);
-          const lateral = p.tendrilOffset * tp + wave;
-          ptx += tdx * pull + (-tdy) * lateral;
-          pty += tdy * pull +  tdx  * lateral;
-        } else if (merge > 0.05 && facing < -0.2 && p.layer === LAYER.RING) {
-          // Tidal streamer — back hemisphere during collision
-          const tidalStr = Math.pow(-facing, 1.2) * merge * ORB_RADIUS * 2.8;
-          const curl = Math.sin(time * 0.05 + p.tendrilPhase) * tidalStr * 0.45;
-          ptx -= tdx * tidalStr + (-tdy) * curl;
-          pty -= tdy * tidalStr +  tdx  * curl;
-        }
+    if (tp > 0 && tdist > 0) {
+      const facing = (offx * tdx + offy * tdy) / offLen;
+      const canTendril = p.layer === LAYER.RING || p.layer === LAYER.HALO;
+      if (canTendril && facing > 0.05) {
+        const maxReach = p.layer === LAYER.HALO ? 380 : 430;
+        const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, maxReach);
+        const armT = pull / Math.max(tdist * 0.70, 1);
+        const waveMag = p.layer === LAYER.HALO ? 44 : 28;
+        const wave = Math.sin(time * 0.08 + p.tendrilPhase + armT * Math.PI * 2.8)
+                     * waveMag * tp * Math.sin(armT * Math.PI);
+        const lateral = p.tendrilOffset * tp + wave;
+        ptx += tdx * pull + (-tdy) * lateral;
+        pty += tdy * pull +  tdx  * lateral;
+      } else if (merge > 0.05 && facing < -0.2 && p.layer === LAYER.RING) {
+        // Tidal streamer — back hemisphere during collision
+        const tidalStr = Math.pow(-facing, 1.2) * merge * ORB_RADIUS * 2.8;
+        const curl = Math.sin(time * 0.05 + p.tendrilPhase) * tidalStr * 0.45;
+        ptx -= tdx * tidalStr + (-tdy) * curl;
+        pty -= tdy * tidalStr +  tdx  * curl;
       }
-      return { x: ptx, y: pty, depth: proj.depth, size: p.size, layer: p.layer, life: p.life ?? 0, noiseOffset: p.noiseOffset ?? 0 };
-    })
-    .sort((a, b) => a.depth - b.depth);
+    }
+    const out = _projBuf[i];
+    out.x = ptx; out.y = pty; out.depth = proj.depth;
+    out.size = p.size; out.layer = p.layer;
+    out.noiseOffset = p.noiseOffset ?? 0;
+  }
+  _projBuf.sort((a, b) => a.depth - b.depth);
+  const projected = _projBuf;
 
   // ── Draw HALO layer first (behind everything) ────────────────────────────
   // Wispy large blobs — deep violet/nebula blue, very transparent
@@ -364,6 +377,8 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
 
 
 const GRID_SPACING = 52;
+// Pre-allocated flat vertex buffer for the grid — grown on demand, never shrunk
+const _gridVerts = [];
 
 function getOrbPositions() {
   const orbs = [{ x: orbX, y: orbY, anger }];
@@ -403,14 +418,16 @@ function drawGrid() {
   const cols = Math.ceil((endX - startX) / GRID_SPACING) + 1;
   const rows = Math.ceil((endY - startY) / GRID_SPACING) + 1;
 
-  // Build displaced vertex grid
-  const verts = [];
+  // Build displaced vertex grid — reuse flat pre-allocated buffer
+  const totalVerts = rows * cols;
+  while (_gridVerts.length < totalVerts) _gridVerts.push({ x: 0, y: 0 });
   for (let r = 0; r < rows; r++) {
-    verts[r] = [];
     for (let c = 0; c < cols; c++) {
       const gx = startX + c * GRID_SPACING;
       const gy = startY + r * GRID_SPACING;
-      verts[r][c] = displacePoint(gx, gy, orbs);
+      const d = displacePoint(gx, gy, orbs);
+      const v = _gridVerts[r * cols + c];
+      v.x = d.x; v.y = d.y;
     }
   }
 
@@ -418,14 +435,14 @@ function drawGrid() {
   ctx.beginPath();
   for (let r = 0; r < rows; r++) {
     for (let c = 0; c < cols; c++) {
-      const v = verts[r][c];
+      const v = _gridVerts[r * cols + c];
       if (c === 0) ctx.moveTo(v.x, v.y);
       else ctx.lineTo(v.x, v.y);
     }
   }
   for (let c = 0; c < cols; c++) {
     for (let r = 0; r < rows; r++) {
-      const v = verts[r][c];
+      const v = _gridVerts[r * cols + c];
       if (r === 0) ctx.moveTo(v.x, v.y);
       else ctx.lineTo(v.x, v.y);
     }
@@ -452,7 +469,7 @@ function drawGrid() {
       }
       if (closest < 300) {
         const g = Math.pow(1 - closest / 300, 2.2) * 0.85;
-        const v = verts[r][c];
+        const v = _gridVerts[r * cols + c];
         ctx.beginPath();
         ctx.arc(v.x, v.y, 1.3, 0, Math.PI * 2);
         ctx.fillStyle = `rgba(${nodeR}, ${nodeG}, ${nodeB}, ${g.toFixed(3)})`;
@@ -477,20 +494,34 @@ function draw() {
     const dist = Math.hypot(localX - orbX, localY - orbY);
     const maxDist = 900;
 
-    if (dist < maxDist) {
-      const progress = 1 - dist / maxDist;
+    // Smooth tp prevents tendrils from snapping when windows separate quickly
+    const rawTp = dist < maxDist ? 1 - dist / maxDist : 0;
+    o.smoothTp += (rawTp - o.smoothTp) * 0.10;
+    const tp = o.smoothTp;
+
+    if (tp > 0.002) {
       // Their orb reaches toward mine
-      drawVortexOrb(localX, localY, progress, orbX, orbY, progress);
+      drawVortexOrb(localX, localY, tp, orbX, orbY, tp);
       // Accumulate weighted centroid for my reach direction
-      weightedTX += localX * progress;
-      weightedTY += localY * progress;
-      totalWeight += progress;
+      weightedTX += localX * tp;
+      weightedTY += localY * tp;
+      totalWeight += tp;
     }
   }
 
-  // My orb reaches toward the weighted centre of all nearby orbs — no snapping
+  // Retain last-known target so fading tendrils point at the right spot
   if (totalWeight > 0) {
-    drawVortexOrb(orbX, orbY, 1, weightedTX / totalWeight, weightedTY / totalWeight, Math.min(totalWeight, 1));
+    smoothedTgtX = weightedTX / totalWeight;
+    smoothedTgtY = weightedTY / totalWeight;
+  }
+
+  // Smooth my own tp so my tendrils also fade out gracefully on separation
+  const rawMyTp = Math.min(totalWeight, 1);
+  mySmoothedTp += (rawMyTp - mySmoothedTp) * 0.10;
+
+  // My orb reaches toward the weighted centre of all nearby orbs
+  if (mySmoothedTp > 0.002) {
+    drawVortexOrb(orbX, orbY, 1, smoothedTgtX, smoothedTgtY, mySmoothedTp);
   } else {
     drawVortexOrb(orbX, orbY, 1, undefined, undefined, 0);
   }
