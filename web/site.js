@@ -23,23 +23,66 @@ let anger = 0;  // 0..1 proximity anger level
 let merge = 0;  // 0..1 deep collision level
 
 const ORB_RADIUS = 96;
-const PARTICLE_COUNT = 1024;
 const TENDRIL_COUNT = 4;
 
-const particles = Array.from({ length: PARTICLE_COUNT }, (_, i) => {
+// ── Particle layers ──────────────────────────────────────────────────────────
+// CORE   : tiny, very bright, fast spin — the hot combusting nucleus
+// RING   : main vortex band, pulls into tendrils
+// HALO   : slow outer wisps, large and transparent
+const LAYER = { CORE: 0, RING: 1, HALO: 2 };
+const COUNTS = { [LAYER.CORE]: 256, [LAYER.RING]: 1024, [LAYER.HALO]: 192 };
+const PARTICLE_COUNT = Object.values(COUNTS).reduce((a, b) => a + b, 0);
+
+function makeParticle(layer, i) {
   const tid = i % TENDRIL_COUNT;
-  return {
-    phi: Math.acos(1 - 2 * Math.random()),
-    theta: Math.random() * Math.PI * 2,
-    r: ORB_RADIUS * (0.65 + Math.random() * 0.4),
-    speed: (0.009 + Math.random() * 0.022) * (Math.random() < 0.5 ? 1 : -1),
-    phiSpeed: (Math.random() - 0.5) * 0.003,
-    size: 1.2 + Math.random() * 2.2,
-    // Tendril group: fixed lateral track and wave phase
-    tendrilOffset: (tid - (TENDRIL_COUNT - 1) / 2) * 22, // -44..44 px lateral spread
-    tendrilPhase: (tid / TENDRIL_COUNT) * Math.PI * 2,
-  };
-});
+  switch (layer) {
+    case LAYER.CORE:
+      return {
+        layer, tid,
+        phi: Math.acos(1 - 2 * Math.random()),
+        theta: Math.random() * Math.PI * 2,
+        r: ORB_RADIUS * (0.05 + Math.random() * 0.30),
+        speed: (0.032 + Math.random() * 0.055) * (Math.random() < 0.5 ? 1 : -1),
+        phiSpeed: (Math.random() - 0.5) * 0.010,
+        size: 0.6 + Math.random() * 1.4,
+        // Per-particle turbulence offsets so each one blinks independently
+        noiseOffset: Math.random() * Math.PI * 2,
+        noiseSpeed: 0.04 + Math.random() * 0.10,
+        tendrilOffset: 0, tendrilPhase: 0,
+      };
+    case LAYER.RING:
+      return {
+        layer, tid,
+        phi: Math.acos(1 - 2 * Math.random()),
+        theta: Math.random() * Math.PI * 2,
+        r: ORB_RADIUS * (0.55 + Math.random() * 0.48),
+        speed: (0.008 + Math.random() * 0.020) * (Math.random() < 0.5 ? 1 : -1),
+        phiSpeed: (Math.random() - 0.5) * 0.003,
+        size: 1.0 + Math.random() * 2.0,
+        tendrilOffset: (tid - (TENDRIL_COUNT - 1) / 2) * 22,
+        tendrilPhase: (tid / TENDRIL_COUNT) * Math.PI * 2,
+      };
+    case LAYER.HALO:
+      return {
+        layer, tid,
+        phi: Math.acos(1 - 2 * Math.random()),
+        theta: Math.random() * Math.PI * 2,
+        r: ORB_RADIUS * (1.05 + Math.random() * 0.55),
+        speed: (0.003 + Math.random() * 0.007) * (Math.random() < 0.5 ? 1 : -1),
+        phiSpeed: (Math.random() - 0.5) * 0.002,
+        size: 3.5 + Math.random() * 5.0,
+        tendrilOffset: (tid - (TENDRIL_COUNT - 1) / 2) * 38,
+        tendrilPhase: (tid / TENDRIL_COUNT) * Math.PI * 2,
+        noiseOffset: Math.random() * Math.PI * 2,
+        noiseSpeed: 0,
+      };
+  }
+}
+
+const particles = [];
+for (const [layer, count] of Object.entries(COUNTS)) {
+  for (let i = 0; i < count; i++) particles.push(makeParticle(Number(layer), i));
+}
 
 channel.onmessage = (event) => {
   const data = event.data;
@@ -109,16 +152,20 @@ function update() {
   const targetMerge = closest < 220 ? Math.pow(1 - closest / 220, 1.4) : 0;
   merge += (targetMerge - merge) * 0.03;
 
-  // Spin particles — faster and more chaotic when angry
-  // Also flatten phi toward equator as merge increases (galactic disc)
+  // Spin particles — layer-specific rates, disc flattening during merge
   const spinMult = 1 + anger * 3.2 + merge * 4.5;
-  const discPull = merge * 0.06; // pull phi toward π/2
+  const discPull = merge * 0.06;
   for (const p of particles) {
-    p.theta += p.speed * spinMult;
-    p.phi += p.phiSpeed * (1 + anger * 1.5);
-    p.phi += (Math.PI / 2 - p.phi) * discPull;
-    if (p.phi < 0.05) { p.phi = 0.05; p.phiSpeed *= -1; }
-    if (p.phi > Math.PI - 0.05) { p.phi = Math.PI - 0.05; p.phiSpeed *= -1; }
+    // Advance per-particle noise phase for core turbulence
+    if (p.noiseOffset !== undefined) p.noiseOffset += p.noiseSpeed;
+    const layerMult = p.layer === LAYER.CORE ? 2.2 : p.layer === LAYER.HALO ? 0.4 : 1.0;
+    p.theta += p.speed * spinMult * layerMult;
+    p.phi   += p.phiSpeed * (1 + anger * 1.5);
+    if (p.layer === LAYER.RING || p.layer === LAYER.HALO) {
+      p.phi += (Math.PI / 2 - p.phi) * discPull;
+    }
+    if (p.phi < 0.04) { p.phi = 0.04; p.phiSpeed *= -1; }
+    if (p.phi > Math.PI - 0.04) { p.phi = Math.PI - 0.04; p.phiSpeed *= -1; }
   }
 
   broadcast();
@@ -192,8 +239,7 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
     if (tdist > 0) { tdx /= tdist; tdy /= tdist; }
   }
 
-  // Project all particles — facing ones stream out in tendril groups,
-  // back-facing ones get flung as tidal streamers during merge
+  // Project all particles — layer-aware displacement
   const projected = particles
     .map(p => {
       const proj = project(cx, cy, p, scale);
@@ -204,50 +250,112 @@ function drawVortexOrb(cx, cy, alphaScale, targetX, targetY, tp) {
 
       if (tp > 0 && tdist > 0) {
         const facing = (offx * tdx + offy * tdy) / offLen;
-        if (facing > 0.05) {
-          // Forward hemisphere: tendril arms toward target
-          const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, 430);
+        const canTendril = p.layer === LAYER.RING || p.layer === LAYER.HALO;
+        if (canTendril && facing > 0.05) {
+          const maxReach = p.layer === LAYER.HALO ? 380 : 430;
+          const pull = Math.pow(facing, 1.4) * tp * Math.min(tdist * 0.70, maxReach);
           const armT = pull / Math.max(tdist * 0.70, 1);
+          const waveMag = p.layer === LAYER.HALO ? 44 : 28;
           const wave = Math.sin(time * 0.08 + p.tendrilPhase + armT * Math.PI * 2.8)
-                       * 28 * tp * Math.sin(armT * Math.PI);
+                       * waveMag * tp * Math.sin(armT * Math.PI);
           const lateral = p.tendrilOffset * tp + wave;
           ptx += tdx * pull + (-tdy) * lateral;
           pty += tdy * pull +  tdx  * lateral;
-        } else if (merge > 0.05 && facing < -0.2) {
-          // Back hemisphere during merge: tidal streamer flung opposite, curving away
+        } else if (merge > 0.05 && facing < -0.2 && p.layer === LAYER.RING) {
+          // Tidal streamer — back hemisphere during collision
           const tidalStr = Math.pow(-facing, 1.2) * merge * ORB_RADIUS * 2.8;
           const curl = Math.sin(time * 0.05 + p.tendrilPhase) * tidalStr * 0.45;
           ptx -= tdx * tidalStr + (-tdy) * curl;
           pty -= tdy * tidalStr +  tdx  * curl;
         }
       }
-      return { x: ptx, y: pty, depth: proj.depth, size: p.size };
+      return { x: ptx, y: pty, depth: proj.depth, size: p.size, layer: p.layer, life: p.life ?? 0, noiseOffset: p.noiseOffset ?? 0 };
     })
     .sort((a, b) => a.depth - b.depth);
 
-  // Precompute colours once per frame (same for all particles)
-  const [cr, cg, cb] = lerpRGB(95, 50, 255, 255, 40, 0, anger);
-
-  // Pass 1 — soft glow halos (large, very transparent, no shadowBlur needed)
+  // ── Draw HALO layer first (behind everything) ────────────────────────────
+  // Wispy large blobs — deep violet/nebula blue, very transparent
   for (const p of projected) {
+    if (p.layer !== LAYER.HALO) continue;
     const d = p.depth;
-    const glowSize = p.size * (1.5 + d * 2.5) * (1 + anger * 1.2);
-    const alpha = (0.018 + d * 0.032 + anger * 0.025);
+    const [hr2, hg2, hb2] = lerpRGB(55, 20, 140, 180, 30, 60, anger);
+    const a = (0.012 + d * 0.022) * (1 + merge * 0.5);
     ctx.beginPath();
-    ctx.arc(p.x, p.y, glowSize, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${alpha})`;
+    ctx.arc(p.x, p.y, p.size * (1.2 + d * 1.8), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${hr2}, ${hg2}, ${hb2}, ${a.toFixed(3)})`;
     ctx.fill();
   }
 
-  // Pass 2 — tight bright cores
+  // ── Draw RING layer ──────────────────────────────────────────────────────
+  // Colour varies: inner edge cyan-white → mid purple → outer deep red when angry
+  // Uses spiral arm tinting: particles in a certain theta band are slightly brighter
+  const [rc, gc, bc] = lerpRGB(95, 50, 255, 255, 40, 0, anger);
+  // Pass 1: soft bloom
   for (const p of projected) {
+    if (p.layer !== LAYER.RING) continue;
     const d = p.depth;
-    const size = p.size * (0.25 + d * 0.95) * (1 + anger * 0.75);
-    const alpha = 0.20 + d * 0.70 + anger * 0.10;
+    const glowS = p.size * (2.0 + d * 2.2) * (1 + anger * 0.8 + merge * 0.6);
     ctx.beginPath();
-    ctx.arc(p.x, p.y, size, 0, Math.PI * 2);
-    ctx.fillStyle = `rgba(${cr}, ${cg}, ${cb}, ${alpha})`;
+    ctx.arc(p.x, p.y, glowS, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rc}, ${gc}, ${bc}, ${(0.012 + d * 0.022).toFixed(3)})`;
     ctx.fill();
+  }
+  // Pass 2: bright cores with comet tails
+  for (const p of projected) {
+    if (p.layer !== LAYER.RING) continue;
+    const d = p.depth;
+    const s = p.size * (0.22 + d * 0.88) * (1 + anger * 0.65 + merge * 0.3);
+    const a = 0.18 + d * 0.68 + anger * 0.08 + merge * 0.06;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, Math.max(s, 0.3), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${rc}, ${gc}, ${bc}, ${a.toFixed(3)})`;
+    ctx.fill();
+  }
+
+  // ── Draw CORE layer ──────────────────────────────────────────────────────
+  // Combusting nucleus: turbulent individual blinking, colour ramps from cool
+  // blue-white (calm) → blinding white (angry) → plasma magenta-white (merge)
+  const heat = Math.min(anger + merge * 1.4, 1);
+  for (const p of projected) {
+    if (p.layer !== LAYER.CORE) continue;
+    const d = p.depth;
+    // Per-particle flicker: independent sine oscillator
+    const flicker = 0.6 + 0.4 * Math.sin(p.noiseOffset);
+    // Extra radial jitter when heated — core particles bulge outward chaotically
+    const distFromCentre = Math.hypot(p.x - cx, p.y - cy);
+    const jitter = heat * ORB_RADIUS * 0.22 * (Math.sin(p.noiseOffset * 1.7) * 0.5 + 0.5);
+    const jx = distFromCentre > 0.5 ? p.x + (p.x - cx) / distFromCentre * jitter : p.x;
+    const jy = distFromCentre > 0.5 ? p.y + (p.y - cy) / distFromCentre * jitter : p.y;
+    // Colour: calm=icy blue-white, angry=pure white, merge=magenta-white plasma
+    const [ccr, ccg, ccb] = heat < 0.5
+      ? lerpRGB(160, 190, 255, 255, 255, 255, heat * 2)
+      : lerpRGB(255, 255, 255, 255, 120, 255, (heat - 0.5) * 2);
+    const a = (0.55 + d * 0.40 + heat * 0.25) * flicker;
+    // Outer combustion bloom
+    const bloomR = p.size * (2.2 + d * 1.8 + heat * 4.0) * flicker;
+    ctx.beginPath();
+    ctx.arc(jx, jy, bloomR, 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${ccr}, ${ccg}, ${ccb}, ${(a * 0.18).toFixed(3)})`;
+    ctx.fill();
+    // Tight bright core dot
+    ctx.beginPath();
+    ctx.arc(jx, jy, Math.max(p.size * (0.5 + d * 0.6 + heat * 0.4), 0.4), 0, Math.PI * 2);
+    ctx.fillStyle = `rgba(${ccr}, ${ccg}, ${ccb}, ${a.toFixed(3)})`;
+    ctx.fill();
+  }
+
+  // ── Draw CORE shockwave ring during merge ─────────────────────────────────
+  // A thin expanding ring radiates from the nucleus during high merge
+  if (merge > 0.15) {
+    const ringPhase = (time * 0.035) % 1;
+    const ringR = ORB_RADIUS * mergeScale * (0.15 + ringPhase * 0.9);
+    const ringA = (1 - ringPhase) * merge * 0.35;
+    const [sr, sg, sb] = lerpRGB(200, 160, 255, 255, 120, 255, merge);
+    ctx.beginPath();
+    ctx.arc(cx, cy, ringR, 0, Math.PI * 2);
+    ctx.strokeStyle = `rgba(${sr}, ${sg}, ${sb}, ${ringA.toFixed(3)})`;
+    ctx.lineWidth = (1 - ringPhase) * 3.5 * merge;
+    ctx.stroke();
   }
 
   ctx.restore();
